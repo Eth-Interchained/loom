@@ -47,6 +47,37 @@ double what was claimed. `loom faultin` now prints the combined bound and
 checks the measured footprint against it, so the arithmetic cannot drift
 again.
 
+### The bug CI caught that my local gate missed
+
+The first push of the signal backend **failed ubuntu CI with `signal: 11,
+SIGSEGV`** — a crash, not an assertion — while my local `cargo fmt` /
+`clippy` / `cargo test --release` gate was green.
+
+Root cause: the handler was installed with `SA_ONSTACK`. **Rust's runtime
+already installs a few-KB per-thread `sigaltstack`** for its own
+stack-overflow detection, so `SA_ONSTACK` ran our handler on that tiny
+stack — and the resolve path calls into `Loom`, whose call chain overflows
+it. A stack overflow inside a SIGSEGV handler is unrecoverable.
+
+Why release hid it: smaller stack frames fit in the altstack. **Debug frames
+did not.** Verified by re-introducing `SA_ONSTACK` (debug dies with SIGSEGV)
+and removing it again (4 consecutive clean debug runs, then 5 more).
+
+Diagnosis was by raw `write(2)` markers in the handler — the only
+async-signal-safe way to see inside it — which printed
+`[H:in][R:absent][R:loom.read..` and then died, pointing straight at the
+call into `Loom` rather than at the fault itself. gdb alone was misleading:
+it stops on the *first* arena fault, which is the normal, expected one.
+
+Two lessons recorded in AGENTS.md as invariants: never `SA_ONSTACK` here,
+and **CI must keep running the debug tier** — release-only testing would not
+have caught this.
+
+One loose end, stated rather than dismissed: the run immediately after the
+deliberately-crashed process reported `1 failed` without my capturing which
+test. It has not reproduced in 8 subsequent runs. Probably residue from the
+killed process; unexplained either way.
+
 ### Not established
 
 - **No line of this has run on macOS.** The signal backend is the same code
