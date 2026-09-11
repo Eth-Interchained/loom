@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  gate:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: unit + proof at test scale (debug)
+        run: cargo test
+      - name: unit + proof at test scale (release)
+        run: cargo test --release
+      - name: build binary
+        run: cargo build --release
+      - name: loom prove on the runner's own disk (1 GiB region / 64 MiB budget)
+        # This is the macOS path actually executing: F_NOCACHE, F_FULLFSYNC,
+        # task_info(TASK_VM_INFO). On Linux it is the O_DIRECT path. The
+        # runner disk is not a device we make claims about; this proves the
+        # code runs on the platform, not what the platform's disk can do.
+        run: |
+          ./target/release/loom prove --pool "${RUNNER_TEMP}/ci.pool" --size 2G --budget 64M --region 1G --ops 20000 | tee prove.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prove-${{ matrix.os }}
+          path: prove.log
