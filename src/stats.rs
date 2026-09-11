@@ -159,6 +159,16 @@ pub struct Stats {
     pub zero_fills: u64,
     /// Misses that skipped the load because the caller overwrote the whole block.
     pub full_overwrites: u64,
+    /// Batched speculative reads issued (one `pread` each).
+    pub prefetch_batches: u64,
+    /// Blocks brought in speculatively by those batches.
+    pub prefetch_blocks: u64,
+    /// Speculative blocks that were later actually asked for. The honest
+    /// scoreboard for prefetch: `prefetch_used / prefetch_blocks` is how
+    /// often the guess was right, and it is never assumed.
+    pub prefetch_used: u64,
+    /// Blocks the caller borrowed in place, with no copy.
+    pub zero_copy: u64,
     /// Frames reclaimed by the CLOCK policy.
     pub evictions: u64,
     /// Dirty frames written to the backing store (on eviction or sync).
@@ -197,6 +207,20 @@ impl Stats {
         s.push_str(&format!(
             "  zero-fills: {}  full-overwrites: {}  evictions: {}  writebacks: {}\n",
             self.zero_fills, self.full_overwrites, self.evictions, self.writebacks
+        ));
+        s.push_str(&format!(
+            "  prefetch: {} batches, {} blocks, {} later used ({})  zero-copy borrows: {}\n",
+            self.prefetch_batches,
+            self.prefetch_blocks,
+            self.prefetch_used,
+            match self.prefetch_blocks {
+                0 => "n/a — prefetch issued nothing".to_string(),
+                n => format!(
+                    "{:.1}% useful",
+                    self.prefetch_used as f64 / n as f64 * 100.0
+                ),
+            },
+            self.zero_copy
         ));
         s.push_str(&format!(
             "  backing read: {}  backing written: {}\n",

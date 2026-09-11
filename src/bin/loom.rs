@@ -14,8 +14,8 @@ USAGE
   loom init  <pool> --size <bytes> [--budget <bytes>] [--block <bytes>]
   loom info  <pool>
   loom prove --pool <path> --size <bytes> --budget <bytes> [--region <bytes>]
-             [--block <bytes>] [--seed <n>] [--ops <n>] [--no-baselines]
-             [--keep] [--allow-small]
+             [--block <bytes>] [--seed <n>] [--ops <n>] [--prefetch <blocks>]
+             [--no-baselines] [--keep] [--allow-small]
 
 SIZES accept K/M/G/T suffixes (binary): 64K, 512M, 16G, 1T.
 
@@ -24,6 +24,11 @@ info    print the pool's geometry and what opening it would allocate.
 prove   run the first experiment against a real device and print a verdict
         in which every number is a measurement. Exit 0 = passed, 1 = failed.
         Default region = 3/4 of --size. Region must be >= 4x budget.
+
+--prefetch <blocks>  speculative read depth once a sequential run is seen.
+                     0 disables it. Default 16 (one 1 MiB read per batch at
+                     the default block size). Run with 0 and without to see
+                     what it is actually worth on your device.
 
 Physical RAM is NOT consulted: the proof is about Loom's own footprint vs
 its budget. Choose --budget below your RAM and --region above it yourself.";
@@ -250,6 +255,9 @@ fn cmd_prove(args: &Args) {
         baselines: !args.has("no-baselines"),
         keep_pool: args.has("keep"),
         allow_small: args.has("allow-small"),
+        prefetch_depth: args
+            .flag("prefetch")
+            .map(|v| v.parse().unwrap_or_else(|_| die("bad --prefetch", 2))),
     };
     if cfg.size < GIB {
         eprintln!(

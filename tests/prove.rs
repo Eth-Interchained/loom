@@ -25,6 +25,7 @@ fn prove_passes_at_test_scale() {
         baselines: true,
         keep_pool: false,
         allow_small: false,
+        prefetch_depth: None,
     };
     let mut out = Vec::new();
     let report = run(&cfg, &mut out);
@@ -59,6 +60,7 @@ fn prove_refuses_meaningless_geometry() {
         baselines: false,
         keep_pool: false,
         allow_small: false,
+        prefetch_depth: None,
     };
     let mut out = Vec::new();
     let report = run(&cfg, &mut out);

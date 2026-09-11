@@ -33,7 +33,7 @@ Real-device proof (exit 0 pass / 1 fail; last line is the verdict):
 | `src/superblock.rs` | on-disk layout: superblock, region table, checksum table, identity block mapping |
 | `src/frames.rs` | the hot tier: fixed frame pool, CLOCK victim selection, dirty/ref bits, `scribble_free` proof hook |
 | `src/checksum.rs` | XXH3-64 per block; `0` = never written |
-| `src/arena.rs` | `Loom`: create/open, `alloc`, `read`, `write`, `sync`, `evict_all`, `close`; the miss path (victim → writeback → load → verify) |
+| `src/arena.rs` | `Loom`: create/open, `alloc`, `read`, `write`, `with_slice`(`_mut`) zero-copy borrows, `sync`, `evict_all`, `close`; the miss path (victim → writeback → load → verify) and the prefetch batcher |
 | `src/footprint.rs` | the budget's witness: `phys_footprint`/`compressed`/`resident_size` (macOS), `RssAnon+RssShmem`/`RssFile`/`VmRSS` (Linux) |
 | `src/stats.rs` | counters + log-scale latency histograms; hit and miss never merged |
 | `src/pattern.rs` | deterministic block content for proofs (regenerated, never stored) |
@@ -51,6 +51,9 @@ Real-device proof (exit 0 pass / 1 fail; last line is the verdict):
 6. No fallback from cache-bypassing I/O to cached I/O. Refuse with the errno.
 7. Every `unsafe` block has a `// SAFETY:` comment naming why it is sound.
 8. `prove` fails on the first false claim; the verdict sentence contains only measured values.
+9. `FramePool::take_free_or_clean` **detaches** the frame before returning and reports the outgoing block; the caller must clear that block's map entry. Not tidiness — a caller claiming several frames in a loop would otherwise be handed the same still-attached frame twice as the CLOCK hand wraps, mapping two blocks to one frame and silently returning the wrong bytes. Regression-tested at both the unit and scan level.
+10. Speculative (prefetch) loads may never write: free or clean frames only, never clobber a resident block, zero-fill a never-written block rather than trusting the disk, and never surface a checksum error for a block the caller did not ask for.
+11. An option a caller passes must reach the object they get. `Loom::create` delegates to `create_with`; substituting defaults on the create path made a "prefetch disabled" measurement report prefetch running.
 
 ## Extending
 

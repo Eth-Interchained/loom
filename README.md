@@ -26,7 +26,7 @@ Storage is not RAM. Loom does not make disk fast; it makes a large working set *
 
 v0 exists to answer one question: *can Loom provide a storage-backed logical arena substantially larger than physical RAM, keep its own RAM consumption bounded, and correctly retrieve data as blocks move between hot and cold?*
 
-`loom prove` runs that experiment against a real device. Its output is a verdict in which every number is a measurement. See [PROOF-RUNS.md](PROOF-RUNS.md) for recorded runs.
+`loom prove` runs that experiment against a real device. Its output is a verdict in which every number is a measurement. See [PROOF-RUNS.md](PROOF-RUNS.md) for recorded runs — including a full macOS/APFS run on platter-class hardware where the correctness and budget claims held and the performance findings are set out without softening.
 
 What v0 **does**:
 
@@ -37,13 +37,18 @@ What v0 **does**:
 - XXH3-64 per block, verified on every promotion from disk. A flipped byte on disk returns `Err(Corrupt { block })`, never data.
 - Clean `sync` → close → reopen persistence (`F_FULLFSYNC` on macOS, `fdatasync` on Linux).
 - Its own footprint witness: `phys_footprint` + `compressed` via `task_info` on macOS, `RssAnon+RssShmem` (+`RssFile`, `VmRSS`) on Linux.
+- **Zero-copy access** (`with_slice` / `with_slice_mut`): borrow the frame's bytes in place. Soundness from the borrow checker, not a pin count — the closure runs while `&mut self` is held, so nothing can evict underneath it. No `unsafe`.
+- **Prefetch**: on a sequential run, one `pread` covering up to 16 blocks instead of 16 separate reads. Speculative loads take only free or clean frames, never clobber a resident block, zero-fill never-written blocks, and defer corruption reports until the block is actually asked for. `prefetch_used / prefetch_blocks` reports how often the guess was wanted, so "it helped" is measured rather than assumed.
 - Hit and miss latency histograms kept **separate**. They are never averaged.
+- Progress reporting during long passes, so a slow device is never mistaken for a hang.
 
 What v0 **does not do** (stated, not implied):
 
 - **Crash consistency.** A crash between `sync`s can leave blocks written whose checksums were not; those blocks then read as `Corrupt`. Detected, not recovered. No log, no atomic table updates.
 - **Free.** Regions are never released. The table is fixed at 4095 regions.
-- **Prefetch, compression, device profiling, HDD-specific extents, `loom stats`, memory-pressure response, Linux as a first-class target, any binding other than Rust.**
+- **Compression, device profiling, HDD-specific extents, `loom stats`, memory-pressure response, Linux as a first-class target, any binding other than Rust.**
+- **Concurrency.** One synchronous I/O at a time — queue depth 1. See below; it is the known ceiling.
+- **Holding two blocks at once.** The zero-copy borrow is one block, scoped to a closure. The explicit pin-count API that would allow more is not built.
 - **Residency guarantees.** Loom bounds what it *allocates*. The OS may still compress or swap those frames; Loom reports that (`compressed` on macOS) instead of denying it. `mlock` is deliberately not on by default.
 
 ## The primitive decision
@@ -93,7 +98,14 @@ arena.sync()?;   // writeback + tables + full fsync
 arena.close()?;  // sync, then close; errors are returned, not swallowed
 ```
 
-Every read/write goes through a frame copy. That is the price of owning residency; it is the price every database buffer manager pays for the same reason.
+```rust
+// Zero copy: borrow the bytes where they already live.
+let sum = arena.with_slice(region, offset, 4096, |bytes| {
+    bytes.iter().map(|&b| b as u64).sum::<u64>()
+})?;
+```
+
+`read`/`write` copy between your buffer and the frame. **On hardware that copy was 41 µs of a 41 µs hit — 99.5% of the cost of serving hot data, and nothing to do with the backing device.** `with_slice` removes it. Prefer it for hot paths; `read`/`write` remain for when you need bytes in your own buffer.
 
 ## Running the proof
 
@@ -126,9 +138,15 @@ Exit 0 on pass, 1 on fail. The last line is the verdict sentence filled with mea
 
 1. **Footprint not bounded.** Max footprint tracks region size instead of budget → something is caching behind Loom (unaligned I/O defeating the bypass, or metadata blow-up).
 2. **Any correctness failure.** One mismatched byte in step 5 or 7, or step 8 returning data. No partial credit.
-3. **Hot hits are not hits.** Hit latency with a disk-shaped tail while `compressed` climbs means the OS took the hot tier away; the budget is decorative on that machine.
-4. **`mmap` wins on everything.** If plain `mmap` beats Loom on throughput *and* p99 *and* its RAM stays within Loom's budget, Loom is a cache in front of a better cache. Observed so far (see PROOF-RUNS.md): `mmap` matches Loom's p50, has a lower p99 because the page cache quietly holds several times Loom's budget, and does fewer ops/s (it faults per 4 KiB page). That is the trade Loom exists to make explicit — but it must keep being measured, not assumed.
-5. **Loom overhead is the workload.** A hit costing more than a few µs over a raw memcpy makes Level 1 unusable as a primitive.
+3. **Hot hits are not hits.** Hit latency with a disk-shaped tail while `compressed` climbs means the OS took the hot tier away; the budget is decorative on that machine. **Partially observed:** on a memory-pressured machine, 95.4 MiB of a 258.5 MiB hot tier was compressed by macOS (≈37%), while hit p99 stayed at 511 ns. The tier still functioned and the *allocation* bound held — but a budget is not a residency guarantee, and Loom prints the number rather than pretending otherwise.
+4. **`mmap` wins on everything.** If plain `mmap` beats Loom on throughput *and* p99 *and* its RAM stays within Loom's budget, Loom is a cache in front of a better cache. **Measured on hardware (see PROOF-RUNS.md): `mmap` took throughput and p99. The only leg that saved the thesis was RAM** — mmap used 321.9 MiB, more than Loom's entire 306 MiB bound, with no way to cap or even report it. The criterion did not fire, but it came within one leg. Loom's differentiator today is *bounded and honest*, not *fast*.
+5. **Loom overhead is the workload.** A hit costing more than a few µs over a raw memcpy makes Level 1 unusable as a primitive. **Measured, and the first reported number was wrong.** The hit histogram times the map lookup and stops *before* the memcpy that delivers the data, so "hit mean 197 ns" — which this README previously quoted — is the residency check, not the cost of a hit. The delivered figure is in the workload line: **41 µs**, of which ~41 µs is copying 64 KiB and 197 ns is Loom's own bookkeeping. So the ledger, CLOCK, dirty tracking and checksum genuinely are free; **the copy was the whole cost**, and `with_slice` exists to remove it. Corrected rather than quietly left flattering.
+
+### The known ceiling: queue depth 1
+
+Loom issues one synchronous `pread`/`pwrite` at a time, and cache-bypassing I/O removes the kernel readahead and writeback batching that would otherwise build queue depth on our behalf. Taking residency from the kernel also took on the obligation to manage concurrency, and v0 does not. At QD1, throughput is `block_size / round-trip` — which is exactly what hardware shows. Closing it (prefetch, coalesced `preadv`/`pwritev`, a writeback pool, `F_PREALLOCATE`) is the next slice, and all of it lives in `io.rs` and the miss path without touching the ledger.
+
+Related, and a design question rather than a tuning knob: the identity mapping (logical block *n* at `data_off + n × block_size`) assumes logical order tracks physical order. **On a copy-on-write filesystem it does not** — rewriting a block relocates its extent. Measured: read B was 4.2× slower than read A over identical offsets on APFS, with no regression at all on ext4.
 
 ## Roadmap (not promises)
 
