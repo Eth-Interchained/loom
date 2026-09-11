@@ -1,0 +1,29 @@
+[package]
+name = "loom-arena"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+license = "BUSL-1.1"
+description = "Loom: a userspace buffer manager giving a process a bounded RAM footprint over a storage-backed logical arena larger than RAM."
+repository = "https://github.com/Eth-Interchained/loom"
+readme = "README.md"
+keywords = ["memory", "storage", "tiering", "buffer-manager", "macos"]
+categories = ["memory-management", "filesystem"]
+
+[lib]
+name = "loom"
+path = "src/lib.rs"
+
+[[bin]]
+name = "loom"
+path = "src/bin/loom.rs"
+
+[dependencies]
+libc = "0.2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.7"
+
+[profile.release]
+debug = 1
