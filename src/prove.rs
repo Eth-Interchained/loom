@@ -17,7 +17,7 @@ use crate::pattern;
 use crate::stats::{fmt_bytes, fmt_ns, LatencyHist};
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct ProveConfig {
@@ -54,6 +54,7 @@ pub struct Report {
     pub write_a_secs: f64,
     pub read_a_secs: f64,
     pub disk_allocated_after_a: u64,
+    pub write_b_secs: f64,
     pub sync_secs: f64,
     pub read_b_secs: f64,
     pub tamper_detected: bool,
@@ -106,11 +107,58 @@ struct Ctx<'a> {
     out: &'a mut dyn Write,
     report: Report,
     fp_max: Option<Footprint>,
+    /// Start of the pass currently in progress, and when we last reported it.
+    pass_started: Option<Instant>,
+    last_progress: Option<Instant>,
 }
+
+/// How often a long pass reports progress. A pass over a large region on a
+/// slow device takes minutes; with no output at all, slow is
+/// indistinguishable from hung — which cost a real debugging round on the
+/// first hardware run.
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
 impl<'a> Ctx<'a> {
     fn say(&mut self, s: impl AsRef<str>) {
         let _ = writeln!(self.out, "{}", s.as_ref());
+    }
+
+    /// Mark the start of a long pass, so `progress` has something to measure
+    /// against.
+    fn begin_pass(&mut self) {
+        let now = Instant::now();
+        self.pass_started = Some(now);
+        self.last_progress = Some(now);
+    }
+
+    /// Report progress at most every [`PROGRESS_INTERVAL`]. `done`/`total` are
+    /// blocks; the rate is derived from bytes actually moved so far.
+    fn progress(&mut self, label: &str, done: u64, total: u64, block_size: u64) {
+        let (Some(started), Some(last)) = (self.pass_started, self.last_progress) else {
+            return;
+        };
+        let now = Instant::now();
+        if now.duration_since(last) < PROGRESS_INTERVAL {
+            return;
+        }
+        self.last_progress = Some(now);
+        let secs = now.duration_since(started).as_secs_f64();
+        let bytes = done * block_size;
+        let rate = bytes as f64 / secs.max(1e-9);
+        let eta = if done > 0 {
+            let remaining = (total - done) as f64 * (secs / done as f64);
+            format!("  eta {:.0}s", remaining)
+        } else {
+            String::new()
+        };
+        let _ = writeln!(
+            self.out,
+            "      … {label}: {done}/{total} blocks ({:.0}%), {}/s, {:.0}s elapsed{eta}",
+            (done as f64 / total as f64) * 100.0,
+            fmt_bytes(rate as u64),
+            secs
+        );
+        let _ = self.out.flush();
     }
     fn fail(&mut self, s: impl Into<String>) {
         let s = s.into();
@@ -162,6 +210,8 @@ pub fn run(cfg: &ProveConfig, out: &mut dyn Write) -> Report {
         out,
         report: Report::default(),
         fp_max: None,
+        pass_started: None,
+        last_progress: None,
     };
     match run_inner(cfg, &mut cx) {
         Ok(()) => {}
@@ -282,11 +332,13 @@ fn run_inner(cfg: &ProveConfig, cx: &mut Ctx) -> Result<()> {
 
     // Step 3: write pattern A.
     let t = Instant::now();
+    cx.begin_pass();
     for b in 0..region_blocks {
         pattern::fill(cfg.seed, b'A', b, &mut scratch);
         loom.write(region, b * bs, &scratch)?;
         if b % 256 == 0 {
             cx.sample_footprint();
+            cx.progress("write A", b, region_blocks, bs);
         }
     }
     cx.sample_footprint();
@@ -334,6 +386,7 @@ fn run_inner(cfg: &ProveConfig, cx: &mut Ctx) -> Result<()> {
     ));
     let hits_before = loom.stats().hits;
     let t = Instant::now();
+    cx.begin_pass();
     let mut mismatches = 0u64;
     let mut first_bad: Option<(u64, usize)> = None;
     for b in 0..region_blocks {
@@ -347,6 +400,7 @@ fn run_inner(cfg: &ProveConfig, cx: &mut Ctx) -> Result<()> {
         }
         if b % 256 == 0 {
             cx.sample_footprint();
+            cx.progress("read A", b, region_blocks, bs);
         }
     }
     cx.sample_footprint();
@@ -379,21 +433,39 @@ fn run_inner(cfg: &ProveConfig, cx: &mut Ctx) -> Result<()> {
     ));
 
     // Step 7: write B, sync, close, reopen, verify B.
+    let t = Instant::now();
+    cx.begin_pass();
     for b in 0..region_blocks {
         pattern::fill(cfg.seed, b'B', b, &mut scratch);
         loom.write(region, b * bs, &scratch)?;
         if b % 256 == 0 {
             cx.sample_footprint();
+            cx.progress("write B", b, region_blocks, bs);
         }
     }
+    cx.report.write_b_secs = t.elapsed().as_secs_f64();
     let t = Instant::now();
     loom.sync()?;
     cx.report.sync_secs = t.elapsed().as_secs_f64();
     let tamper_block = loom.block_of_region_offset(region, (region_blocks / 2) * bs);
     let tamper_off = loom.backing_offset_of_block(tamper_block);
     loom.close()?;
+    // Write A landed in sparse holes (the filesystem had to allocate an
+    // extent per block); write B overwrote the same, now-allocated region.
+    // Identical work otherwise, so the ratio isolates the cost of allocation
+    // — on a copy-on-write filesystem it also exposes whether "overwrite"
+    // really means overwrite.
     cx.say(format!(
-        "[7] wrote pattern B, sync (writeback + tables + full fsync) took {:.2}s; closed",
+        "[7] wrote pattern B over the allocated region: {} in {:.2}s ({}/s) vs write A into sparse holes {:.2}s ({}/s) = {:.2}x",
+        fmt_bytes(cfg.region),
+        cx.report.write_b_secs,
+        fmt_bytes((cfg.region as f64 / cx.report.write_b_secs.max(1e-9)) as u64),
+        cx.report.write_a_secs,
+        fmt_bytes((cfg.region as f64 / cx.report.write_a_secs.max(1e-9)) as u64),
+        cx.report.write_a_secs / cx.report.write_b_secs.max(1e-9)
+    ));
+    cx.say(format!(
+        "    sync (writeback + tables + full fsync) took {:.2}s; closed",
         cx.report.sync_secs
     ));
     let mut loom = Loom::open(
@@ -413,6 +485,7 @@ fn run_inner(cfg: &ProveConfig, cx: &mut Ctx) -> Result<()> {
         }
     };
     let t = Instant::now();
+    cx.begin_pass();
     let mut mismatches = 0u64;
     let mut first_bad = None;
     for b in 0..region_blocks {
@@ -426,13 +499,31 @@ fn run_inner(cfg: &ProveConfig, cx: &mut Ctx) -> Result<()> {
         }
         if b % 256 == 0 {
             cx.sample_footprint();
+            cx.progress("read B", b, region_blocks, bs);
         }
     }
     cx.report.read_b_secs = t.elapsed().as_secs_f64();
     cx.say(format!(
-        "    reopened; read B back: {} blocks in {:.2}s, {} mismatching",
-        region_blocks, cx.report.read_b_secs, mismatches
+        "    reopened; read B back: {} blocks in {:.2}s ({}/s), {} mismatching",
+        region_blocks,
+        cx.report.read_b_secs,
+        fmt_bytes((cfg.region as f64 / cx.report.read_b_secs.max(1e-9)) as u64),
+        mismatches
     ));
+    // Read A and read B do identical work over identical offsets. A large
+    // gap means the pool's physical layout changed under us between them —
+    // on a copy-on-write filesystem, rewriting a block relocates its extent,
+    // so Loom's identity mapping (logical block n at data_off + n*bs) stops
+    // corresponding to physical locality. Surfaced, not averaged away.
+    if cx.report.read_a_secs > 0.0 {
+        let ratio = cx.report.read_b_secs / cx.report.read_a_secs;
+        if ratio >= 1.5 || ratio <= 0.67 {
+            cx.note(format!(
+                "read B is {:.2}x read A over the same offsets ({:.2}s vs {:.2}s) — the pool's physical layout changed between the passes (copy-on-write relocation on rewrite, or device-side housekeeping). Loom's logical order no longer matches physical order.",
+                ratio, cx.report.read_b_secs, cx.report.read_a_secs
+            ));
+        }
+    }
     if mismatches > 0 {
         let (b, pos) = first_bad.unwrap();
         cx.fail(format!(
@@ -500,10 +591,14 @@ fn run_inner(cfg: &ProveConfig, cx: &mut Ctx) -> Result<()> {
         let base_miss = loom.stats().misses;
         let mut hist = LatencyHist::new();
         let t = Instant::now();
-        for &b in &seq {
+        cx.begin_pass();
+        for (i, &b) in seq.iter().enumerate() {
             let t1 = Instant::now();
             loom.read(region, b * bs, &mut readback)?;
             hist.record(t1.elapsed());
+            if i % 256 == 0 {
+                cx.progress("skew (loom)", i as u64, cfg.ops, bs);
+            }
         }
         let secs = t.elapsed().as_secs_f64();
         cx.sample_footprint();
@@ -548,10 +643,14 @@ fn run_inner(cfg: &ProveConfig, cx: &mut Ctx) -> Result<()> {
             let backing = Backing::open(&cfg.pool, false)?;
             let mut hist = LatencyHist::new();
             let t = Instant::now();
-            for &off in &offsets {
+            cx.begin_pass();
+            for (i, &off) in offsets.iter().enumerate() {
                 let t1 = Instant::now();
                 backing.pread_exact(&mut readback, off)?;
                 hist.record(t1.elapsed());
+                if i % 256 == 0 {
+                    cx.progress("skew (pread)", i as u64, cfg.ops, bs);
+                }
             }
             let wr = WorkloadResult {
                 label: "pread".into(),
