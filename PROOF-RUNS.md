@@ -2,6 +2,64 @@
 
 Every number below is copied verbatim from `loom prove` output. Nothing is rounded.
 
+## 2026-09-11 — `loom faultin`: 2 GiB addressed through a raw pointer in 129 MiB of RAM
+
+The signal backend (`SIGSEGV`/`SIGBUS` + `mprotect`) — **the same code that runs
+on macOS**, executed here on Linux. `loom faultin` is the demonstration
+command: it seeds an arena with a verifiable pattern, hands out a raw
+pointer, walks the whole thing with ordinary dereferences, and reports.
+
+```
+$ loom faultin --pool /agent/workspace/fi2.pool --arena 2G --budget 128M
+
+LOOM FAULTIN  arena=2.00 GiB  extent=64.0 KiB
+  RAM: 128.0 MiB mapped arena + 256.0 KiB Loom staging = 128.2 MiB total budget
+[0] process footprint before Loom: 140.0 KiB
+[1] seeded 2.00 GiB in 4.0s (513.6 MiB/s)
+[2] arena mapped at 0x7f366c200000: 2.00 GiB addressable, 128.0 MiB may be
+    resident (16.0x over budget)
+[3] read 2.00 GiB in 5.8s (352.6 MiB/s), 0 mismatching blocks
+    load faults: 32768  write faults: 0  evictions: 30720 (0 wrote back)
+    resident: 2048 extents (128.0 MiB)  peak: 2048 (128.0 MiB)
+[4] warm pass over 128.0 MiB: first 223.698ms, second 0.966ms;
+    load faults 32768 -> 34816 -> 34816
+    the second pass took ZERO further faults — a hit runs no Loom code at all
+[5] process footprint after: 129.1 MiB
+    against a combined budget of 128.2 MiB -> within bound
+
+RESULT: addressed 2.00 GiB of memory through a plain pointer while never
+mapping more than 128.0 MiB. Every byte verified. 34816 faults, 32768
+evictions, 0 writebacks, 0 failures.
+```
+
+### A defect this demo found, and it was doubling the budget
+
+The first run reported **`process footprint after: 257.8 MiB` for a stated
+128 MiB budget.** Two caches for one budget: the fault arena's mapped pages
+are the cache, and the `Loom` underneath it had *also* been given a 128 MiB
+frame pool, even though it is only the I/O path. Giving Loom 256 KiB of
+staging instead brought the footprint to **129.1 MiB** against a 128.2 MiB
+combined bound.
+
+Worth naming because the run "passed" both times. Nothing crashed, every
+byte verified, and the headline number was true — it was the *cost* that was
+double what was claimed. `loom faultin` now prints the combined bound and
+checks the measured footprint against it, so the arithmetic cannot drift
+again.
+
+### Not established
+
+- **No line of this has run on macOS.** The signal backend is the same code
+  on both platforms by construction, and both apple-darwin targets check
+  clean, but checking is not running.
+- A signal handler calling `mprotect` is outside POSIX's async-signal-safe
+  list. It is how JITs and GCs did lazy paging for decades; it is not a
+  guarantee. Mach exception ports are the clean macOS mechanism and are not
+  written.
+- One arena per process; the handler locates its arena from the faulting
+  address alone, so a second install is refused rather than silently sharing.
+- FIFO eviction, not CLOCK. Simple, and labelled simple.
+
 ## 2026-09-11 — transparent fault-in, proven (Hyperagent sandbox, Linux 6.18, `userfaultfd`)
 
 The mechanism that turns Loom from a library you call into memory a program

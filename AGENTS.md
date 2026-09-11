@@ -38,6 +38,7 @@ Real-device proof (exit 0 pass / 1 fail; last line is the verdict):
 | `src/stats.rs` | counters + log-scale latency histograms; hit and miss never merged |
 | `src/pattern.rs` | deterministic block content for proofs (regenerated, never stored) |
 | `src/faultin.rs` | **Linux only.** Transparent fault-in over `userfaultfd` (MISSING\|WP): raw pointer, handler thread, exact dirty tracking, bounded residency |
+| `src/faultin_signal.rs` | **macOS + Linux.** Same architecture over `SIGSEGV`/`SIGBUS` + `mprotect`. Handler allocates nothing, spin-locked state, chains to the previous disposition. One arena per process |
 | `src/prove.rs` | the experiment; `run(&ProveConfig, &mut dyn Write) -> Report` |
 | `src/bin/loom.rs` | `init` / `info` / `prove`; hand-parsed args |
 | `tests/prove.rs` | the experiment at test scale (256 MiB arena / 8 MiB budget) |
@@ -56,7 +57,10 @@ Real-device proof (exit 0 pass / 1 fail; last line is the verdict):
 10. Speculative (prefetch) loads may never write: free or clean frames only, never clobber a resident block, zero-fill a never-written block rather than trusting the disk, and never surface a checksum error for a block the caller did not ask for.
 11. An unresolvable fault leaves the faulting thread **blocked** and records the address and reason in `FaultStats::failures`. Waking it onto bytes we failed to load would hand it silent garbage; a hang that says why beats corruption that doesn't.
 12. `FaultArena::drop` flushes dirty extents **before** stopping the handler and unmapping, and joins the handler before `munmap` — unmapping under a live handler would be a use-after-free of the mapping.
-13. An option a caller passes must reach the object they get. `Loom::create` delegates to `create_with`; substituting defaults on the create path made a "prefetch disabled" measurement report prefetch running.
+13. The signal handler **allocates nothing** and takes no lock the faulting thread could hold. A `malloc` in a handler that interrupted `malloc` is a deadlock; that is why `Inner` preallocates `state`, `ring` and `staging`.
+14. The signal handler **chains** to the saved previous disposition for any fault outside `[BASE, END)` and for any fault it cannot resolve. Swallowing another subsystem's `SIGSEGV` silently breaks crash reporting process-wide. `Drop` disarms (`BASE = 0`) *before* restoring dispositions and unmapping.
+15. When stacking a fault arena on a `Loom`, the `Loom` frame budget must be SMALL — the arena's mapped pages are the cache; Loom is the I/O path. Equal budgets stack and double the footprint (measured 257.8 MiB for a stated 128 MiB).
+16. An option a caller passes must reach the object they get. `Loom::create` delegates to `create_with`; substituting defaults on the create path made a "prefetch disabled" measurement report prefetch running.
 
 ## Extending
 
