@@ -20,6 +20,10 @@ pub struct FrameMeta {
     pub dirty: bool,
     /// CLOCK reference bit; set on every access, cleared as the hand passes.
     pub referenced: bool,
+    /// This block was brought in by prefetch and has not been asked for yet.
+    /// Lets Loom count how many speculative reads were actually wanted,
+    /// rather than assuming prefetch helped.
+    pub prefetched: bool,
 }
 
 pub struct FramePool {
@@ -39,6 +43,7 @@ impl FramePool {
                 block: NO_BLOCK,
                 dirty: false,
                 referenced: false,
+                prefetched: false,
             };
             frame_count
         ];
@@ -140,7 +145,74 @@ impl FramePool {
             block,
             dirty,
             referenced: true,
+            prefetched: false,
         };
+    }
+
+    /// Bind a frame to a block that was read speculatively. Marked
+    /// `prefetched` and NOT referenced: an unwanted prefetch should be the
+    /// first thing CLOCK reclaims, not something that survives a sweep on
+    /// the strength of having been guessed at.
+    pub fn assign_prefetched(&mut self, frame: u32, block: u64) {
+        self.meta[frame as usize] = FrameMeta {
+            block,
+            dirty: false,
+            referenced: false,
+            prefetched: true,
+        };
+    }
+
+    /// Clear the prefetched flag, returning whether it had been set — i.e.
+    /// whether this access is the one that justified the speculative read.
+    pub fn claim_prefetch(&mut self, frame: u32) -> bool {
+        let m = &mut self.meta[frame as usize];
+        std::mem::replace(&mut m.prefetched, false)
+    }
+
+    pub fn free_count(&self) -> usize {
+        self.free.len()
+    }
+
+    /// Take a frame reclaimable without writing anything back: a free frame,
+    /// or a clean resident one. `None` if every frame is dirty. Used for
+    /// speculative loads, which must never turn a read into a write — that
+    /// would make prefetch cost more than it saves.
+    ///
+    /// Returns `(frame, outgoing_block)`, where `outgoing_block` is
+    /// [`NO_BLOCK`] if the frame was already free. **The frame is DETACHED
+    /// before returning** — its metadata no longer claims a block. That is
+    /// not tidiness, it is the correctness property: a caller in a loop
+    /// (prefetch claims up to `depth` frames before doing any I/O) would
+    /// otherwise see the same still-attached, still-clean, still-unreferenced
+    /// frame come round again as the CLOCK hand wraps, and hand it to two
+    /// different blocks. Both map entries would point at one frame and one
+    /// of them would read the other's bytes. Detaching makes the frame look
+    /// free to the sweep, so it cannot be chosen twice.
+    ///
+    /// The caller MUST clear `outgoing_block`'s entry in the block map.
+    pub fn take_free_or_clean(&mut self) -> Option<(u32, u64)> {
+        if let Some(f) = self.free.pop() {
+            return Some((f, NO_BLOCK));
+        }
+        let n = self.meta.len();
+        for _ in 0..(2 * n + 1) {
+            let i = self.hand;
+            self.hand = (self.hand + 1) % n;
+            let m = &mut self.meta[i];
+            if m.block == NO_BLOCK || m.dirty {
+                continue;
+            }
+            if m.referenced {
+                m.referenced = false;
+            } else {
+                let outgoing = m.block;
+                m.block = NO_BLOCK;
+                m.referenced = false;
+                m.prefetched = false;
+                return Some((i as u32, outgoing));
+            }
+        }
+        None
     }
 
     /// Unbind a frame and return it to the free list. Contents are left in
@@ -151,6 +223,7 @@ impl FramePool {
         m.block = NO_BLOCK;
         m.dirty = false;
         m.referenced = false;
+        m.prefetched = false;
         self.free.push(frame);
     }
 
@@ -214,5 +287,49 @@ mod tests {
         assert!(p.data(a).iter().all(|&x| x == 0xAA));
         let other = if a == 0 { 1 } else { 0 };
         assert!(p.data(other).iter().all(|&x| x == 0x55));
+    }
+
+    /// Regression: a caller claiming several frames in a loop must never be
+    /// handed the same frame twice, even as the CLOCK hand wraps.
+    #[test]
+    fn take_free_or_clean_never_returns_a_frame_twice() {
+        let mut p = FramePool::new(4, 4096);
+        // Fill every frame with a clean, unreferenced block.
+        for b in 0..4u64 {
+            let f = p.take_free().unwrap();
+            p.assign(f, 100 + b, false);
+            p.meta[f as usize].referenced = false;
+        }
+        assert_eq!(p.free_count(), 0);
+        let mut seen = Vec::new();
+        let mut outgoing = Vec::new();
+        // Ask for more than the pool holds; every answer must be distinct.
+        for _ in 0..4 {
+            let (f, out) = p.take_free_or_clean().expect("clean frames are available");
+            assert!(!seen.contains(&f), "frame {f} handed out twice: {seen:?}");
+            seen.push(f);
+            outgoing.push(out);
+        }
+        assert_eq!(seen.len(), 4);
+        // Each reported an outgoing block, and all four were distinct.
+        outgoing.sort_unstable();
+        assert_eq!(outgoing, vec![100, 101, 102, 103]);
+        // Pool is now exhausted of clean candidates.
+        assert!(p.take_free_or_clean().is_none());
+    }
+
+    #[test]
+    fn take_free_or_clean_refuses_dirty_frames() {
+        let mut p = FramePool::new(2, 4096);
+        let a = p.take_free().unwrap();
+        let b = p.take_free().unwrap();
+        p.assign(a, 7, true);
+        p.assign(b, 8, true);
+        p.meta[a as usize].referenced = false;
+        p.meta[b as usize].referenced = false;
+        assert!(
+            p.take_free_or_clean().is_none(),
+            "speculative load must never evict a dirty frame"
+        );
     }
 }

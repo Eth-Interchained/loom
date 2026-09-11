@@ -33,6 +33,8 @@ pub struct ProveConfig {
     pub keep_pool: bool,
     /// Allow region < 4x budget (the run is then not a meaningful proof).
     pub allow_small: bool,
+    /// Speculative-read depth in blocks; None = engine default, Some(0) = off.
+    pub prefetch_depth: Option<usize>,
 }
 
 /// Fixed allowance for everything in the process that is not Loom's frames
@@ -278,12 +280,16 @@ fn run_inner(cfg: &ProveConfig, cx: &mut Ctx) -> Result<()> {
         )));
     }
     let t = Instant::now();
-    let mut loom = Loom::create(
+    let mut loom = Loom::create_with(
         &cfg.pool,
         CreateOptions {
             capacity: cfg.size,
             block_size: cfg.block_size,
             budget: cfg.budget,
+        },
+        OpenOptions {
+            budget: Some(cfg.budget),
+            prefetch_depth: cfg.prefetch_depth,
         },
     )?;
     let info = loom.info()?;
@@ -299,6 +305,14 @@ fn run_inner(cfg: &ProveConfig, cx: &mut Ctx) -> Result<()> {
         fmt_bytes(info.metadata_bytes),
         fmt_bytes(info.disk_allocated),
         info.cache_mode
+    ));
+    cx.say(format!(
+        "    prefetch depth in force: {} blocks ({})",
+        loom.prefetch_depth(),
+        match loom.prefetch_depth() {
+            0 | 1 => "disabled".to_string(),
+            d => format!("one {} read per batch", fmt_bytes(d as u64 * bs)),
+        }
     ));
     if info.disk_allocated > 16 << 20 {
         cx.fail(format!(
@@ -472,6 +486,7 @@ fn run_inner(cfg: &ProveConfig, cx: &mut Ctx) -> Result<()> {
         &cfg.pool,
         OpenOptions {
             budget: Some(cfg.budget),
+            prefetch_depth: cfg.prefetch_depth,
         },
     )?;
     let regs = loom.regions();
@@ -540,6 +555,7 @@ fn run_inner(cfg: &ProveConfig, cx: &mut Ctx) -> Result<()> {
             &cfg.pool,
             OpenOptions {
                 budget: Some(cfg.budget),
+                prefetch_depth: cfg.prefetch_depth,
             },
         )?;
         match loom.read(region, (region_blocks / 2) * bs, &mut readback) {
@@ -562,6 +578,7 @@ fn run_inner(cfg: &ProveConfig, cx: &mut Ctx) -> Result<()> {
             &cfg.pool,
             OpenOptions {
                 budget: Some(cfg.budget),
+                prefetch_depth: cfg.prefetch_depth,
             },
         )?;
         pattern::fill(cfg.seed, b'B', region_blocks / 2, &mut scratch);

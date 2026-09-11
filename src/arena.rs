@@ -47,7 +47,21 @@ pub struct CreateOptions {
 pub struct OpenOptions {
     /// Override the pool's recorded default budget.
     pub budget: Option<u64>,
+    /// Blocks to read per speculative batch once a sequential run is
+    /// detected. `None` uses [`DEFAULT_PREFETCH_DEPTH`]; `Some(0)` disables
+    /// prefetch entirely (useful for measuring what it is worth).
+    pub prefetch_depth: Option<usize>,
 }
+
+/// Blocks per speculative batch. At 64 KiB blocks that is one 1 MiB read
+/// instead of sixteen 64 KiB reads — the point is amortising the device
+/// round-trip, which dominates everything on a seek-bound device.
+pub const DEFAULT_PREFETCH_DEPTH: usize = 16;
+
+/// A sequential run must be this long before speculating. Two consecutive
+/// blocks is a coincidence; three is a pattern. Guessing earlier wastes
+/// bandwidth on random workloads.
+const SEQ_RUN_THRESHOLD: u32 = 3;
 
 /// Static facts about an open arena — the numbers Loom can state as
 /// allocations, not as hopes.
@@ -80,11 +94,31 @@ pub struct Loom {
     budget: u64,
     stats: Stats,
     dirty_meta: bool,
+    /// Speculative-read depth in blocks; 0 disables.
+    prefetch_depth: usize,
+    /// Staging buffer for batched reads. Allocated only if prefetch is on,
+    /// and counted in `metadata_bytes` so it cannot hide from the budget.
+    prefetch_buf: Option<AlignedBuf>,
+    /// Last block a miss was taken on, and how long the ascending run is.
+    last_miss_block: Option<u64>,
+    seq_run: u32,
 }
 
 impl Loom {
-    /// Create a new pool file and open it.
+    /// Create a new pool file and open it with default open options.
     pub fn create(path: &Path, opts: CreateOptions) -> Result<Self> {
+        Self::create_with(path, opts, OpenOptions::default())
+    }
+
+    /// Create a new pool file and open it with the given open options.
+    ///
+    /// Separate from [`Loom::create`] because a caller who asks for, say,
+    /// prefetch disabled must get that on the freshly created arena too —
+    /// not only after a close and reopen. `create` silently substituting
+    /// defaults made a measurement of "prefetch off" report prefetch
+    /// happening, which is exactly the kind of quiet substitution this
+    /// codebase is supposed to refuse.
+    pub fn create_with(path: &Path, opts: CreateOptions, open: OpenOptions) -> Result<Self> {
         let sb = Superblock::new(opts.block_size, opts.capacity, opts.budget)?;
         if opts.budget < opts.block_size as u64 {
             return Err(LoomError::Invalid(format!(
@@ -99,7 +133,7 @@ impl Loom {
         // The checksum table is left as sparse zeros: 0 == UNWRITTEN.
         backing.sync()?;
         drop(backing);
-        Self::open(path, OpenOptions { budget: None })
+        Self::open(path, open)
     }
 
     pub fn open(path: &Path, opts: OpenOptions) -> Result<Self> {
@@ -143,6 +177,18 @@ impl Loom {
         }
         let frames = FramePool::new(frame_count, sb.block_size as usize);
         let map = vec![NO_FRAME; sb.nblocks as usize];
+        // Never speculate over more than a quarter of the pool: a batch
+        // that evicts most of the hot set to make room for guesses is a
+        // thrash machine, not a prefetcher.
+        let prefetch_depth = opts
+            .prefetch_depth
+            .unwrap_or(DEFAULT_PREFETCH_DEPTH)
+            .min(frame_count / 4);
+        let prefetch_buf = if prefetch_depth > 1 {
+            Some(AlignedBuf::zeroed(prefetch_depth * sb.block_size as usize))
+        } else {
+            None
+        };
         Ok(Loom {
             backing,
             sb,
@@ -153,6 +199,10 @@ impl Loom {
             budget,
             stats: Stats::default(),
             dirty_meta: false,
+            prefetch_depth,
+            prefetch_buf,
+            last_miss_block: None,
+            seq_run: 0,
         })
     }
 
@@ -195,6 +245,11 @@ impl Loom {
             + self.checksums.len() as u64
             + REGION_TABLE_LEN
             + (self.frames.frame_count() * std::mem::size_of::<crate::frames::FrameMeta>()) as u64
+            + self.prefetch_buf.as_ref().map(|b| b.len()).unwrap_or(0) as u64
+    }
+
+    pub fn prefetch_depth(&self) -> usize {
+        self.prefetch_depth
     }
 
     pub fn info(&self) -> Result<Info> {
@@ -322,6 +377,102 @@ impl Loom {
         Ok(())
     }
 
+    /// Load `block` and up to `depth-1` following blocks in ONE read.
+    ///
+    /// The point is the device round-trip, not the bytes: sixteen 64 KiB
+    /// reads cost sixteen seeks, one 1 MiB read costs one. On the first
+    /// hardware run a seek was 10.49 ms and the bytes were free, so this is
+    /// the single biggest lever available.
+    ///
+    /// Rules it will not break:
+    /// - Speculative blocks only take free or CLEAN frames. Prefetch must
+    ///   never turn a read into a writeback; that would cost more than it saves.
+    /// - A resident block is never clobbered — it may be dirty, and the
+    ///   frame is the only copy of those bytes.
+    /// - A never-written block (checksum == UNWRITTEN) is zero-filled, not
+    ///   trusted: whatever the disk holds there is meaningless.
+    /// - A checksum mismatch on a *speculative* block is skipped silently
+    ///   rather than returned as an error, because the caller did not ask
+    ///   for it. It will be re-read, verified and reported the moment
+    ///   someone actually does.
+    ///
+    /// Returns the number of blocks made resident, or None if the batch
+    /// could not be attempted (no staging buffer, no reclaimable frames).
+    fn prefetch_batch(&mut self, first: u64, depth: usize) -> Result<Option<u64>> {
+        let bs = self.sb.block_size as usize;
+        let count = (depth as u64).min(self.sb.nblocks - first);
+        if count < 2 || self.prefetch_buf.is_none() {
+            return Ok(None);
+        }
+        // Claim frames up front. If we cannot get one for a given block we
+        // simply load fewer — a short batch is still one seek.
+        let mut claimed: Vec<(u64, u32)> = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let b = first + i;
+            if self.map[b as usize] != NO_FRAME {
+                continue; // already resident; never clobber
+            }
+            match self.frames.take_free_or_clean() {
+                Some((f, outgoing)) => {
+                    // The frame arrives detached; its previous block's map
+                    // entry is ours to clear. Leaving it would point the old
+                    // block at a frame now holding different bytes —
+                    // silently wrong data on a later read.
+                    if outgoing != crate::frames::NO_BLOCK {
+                        self.map[outgoing as usize] = NO_FRAME;
+                        self.stats.evictions += 1;
+                    }
+                    claimed.push((b, f))
+                }
+                None => break,
+            }
+        }
+        if claimed.is_empty() {
+            return Ok(None);
+        }
+        // One read covering the whole span, including blocks we skipped.
+        let span = count as usize * bs;
+        let off = self.sb.block_off(first);
+        let mut buf = self.prefetch_buf.take().expect("checked above");
+        let read = self.backing.pread_exact(&mut buf[..span], off);
+        if let Err(e) = read {
+            // Hand back every frame we took, then report. Nothing is left
+            // half-bound.
+            for (_, f) in claimed {
+                self.frames.release(f);
+            }
+            self.prefetch_buf = Some(buf);
+            return Err(e);
+        }
+        self.stats.prefetch_batches += 1;
+        self.stats.bytes_read_backing += span as u64;
+
+        let mut loaded = 0u64;
+        for (b, f) in claimed {
+            let i = (b - first) as usize;
+            let src = &buf[i * bs..(i + 1) * bs];
+            let stored = self.ck(b);
+            if stored == UNWRITTEN {
+                self.frames.data_mut(f).fill(0);
+            } else if block_checksum(src) != stored {
+                // Not ours to complain about — nobody asked for this block.
+                // `b` was never mapped and the outgoing block's mapping was
+                // already cleared, so returning the frame leaves no stale
+                // entry behind.
+                self.frames.release(f);
+                continue;
+            } else {
+                self.frames.data_mut(f).copy_from_slice(src);
+            }
+            self.frames.assign_prefetched(f, b);
+            self.map[b as usize] = f;
+            loaded += 1;
+        }
+        self.prefetch_buf = Some(buf);
+        self.stats.prefetch_blocks += loaded;
+        Ok(Some(loaded))
+    }
+
     /// Make `block` resident and return its frame. If `full_overwrite`, the
     /// caller promises to overwrite every byte before reading, so the load
     /// from disk is skipped.
@@ -329,10 +480,42 @@ impl Loom {
         let t = Instant::now();
         let f = self.map[block as usize];
         if f != NO_FRAME {
+            if self.frames.claim_prefetch(f) {
+                self.stats.prefetch_used += 1;
+            }
             self.frames.touch(f);
             self.stats.hits += 1;
             self.stats.hit_latency.record(t.elapsed());
             return Ok(f);
+        }
+
+        // Miss. Update the sequential-run detector before doing anything
+        // else, so the decision is made on the access pattern rather than
+        // on what the pool happens to hold.
+        self.seq_run = match self.last_miss_block {
+            Some(prev) if block == prev + 1 => self.seq_run.saturating_add(1),
+            _ => 1,
+        };
+        self.last_miss_block = Some(block);
+
+        // Speculate only on an established forward run, and never when the
+        // caller is about to overwrite the whole block (they want no bytes
+        // from disk at all).
+        if !full_overwrite && self.prefetch_depth > 1 && self.seq_run >= SEQ_RUN_THRESHOLD {
+            let depth = self.prefetch_depth;
+            if self.prefetch_batch(block, depth)?.is_some() {
+                let f = self.map[block as usize];
+                if f != NO_FRAME {
+                    // The batch served the requested block. Still a miss —
+                    // it was not resident when asked for — but it cost a
+                    // shared seek rather than its own.
+                    self.frames.claim_prefetch(f);
+                    self.frames.touch(f);
+                    self.stats.misses += 1;
+                    self.stats.miss_latency.record(t.elapsed());
+                    return Ok(f);
+                }
+            }
         }
 
         let frame = match self.frames.take_free() {
@@ -382,6 +565,90 @@ impl Loom {
         self.stats.misses += 1;
         self.stats.miss_latency.record(t.elapsed());
         Ok(frame)
+    }
+
+    // ---- zero-copy access ----------------------------------------------
+    //
+    // `read`/`write` copy between the caller's buffer and the frame. On the
+    // first hardware run that copy was 41µs of a 41µs hit — 99.5% of the
+    // cost of serving hot data, and nothing to do with the backing device.
+    //
+    // These two give the caller the frame's bytes directly. Soundness comes
+    // from the borrow checker rather than a pin count: the closure runs
+    // while `&mut self` is held, so no other arena call — and therefore no
+    // eviction — can happen while the borrow is live. Zero copy, zero
+    // `unsafe`, no way to hold a stale frame.
+    //
+    // The cost of that simplicity: one block at a time, and the slice cannot
+    // outlive the closure. A caller needing two blocks at once wants the
+    // explicit pin-count API, which is not built yet.
+
+    /// Borrow up to `max` bytes at `off` **in place**, with no copy.
+    ///
+    /// The slice passed to `f` stops at the end of the containing block, so
+    /// it may be shorter than `max`; its length is the caller's signal to
+    /// loop. Returns whatever `f` returns.
+    pub fn with_slice<R>(
+        &mut self,
+        r: Region,
+        off: u64,
+        max: usize,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R> {
+        let (frame, inb, n) = self.locate(r, off, max, false)?;
+        self.stats.zero_copy += 1;
+        let data = &self.frames.data(frame)[inb..inb + n];
+        Ok(f(data))
+    }
+
+    /// Mutable in-place borrow. The block is marked dirty unconditionally —
+    /// the caller was handed write access, so Loom must assume it was used.
+    pub fn with_slice_mut<R>(
+        &mut self,
+        r: Region,
+        off: u64,
+        max: usize,
+        f: impl FnOnce(&mut [u8]) -> R,
+    ) -> Result<R> {
+        let (frame, inb, n) = self.locate(r, off, max, false)?;
+        self.stats.zero_copy += 1;
+        let out = {
+            let data = &mut self.frames.data_mut(frame)[inb..inb + n];
+            f(data)
+        };
+        self.frames.mark_dirty(frame);
+        Ok(out)
+    }
+
+    /// Resolve `off` to (frame, offset within frame, contiguous length),
+    /// making the block resident if it isn't. Shared by the copying and
+    /// zero-copy paths so there is exactly one residency code path.
+    fn locate(
+        &mut self,
+        r: Region,
+        off: u64,
+        max: usize,
+        full_overwrite: bool,
+    ) -> Result<(u32, usize, usize)> {
+        self.check_bounds(r, off, max.min(1) as u64)?;
+        let bs = self.sb.block_size as u64;
+        let abs = r.offset + off;
+        let block = abs / bs;
+        let inb = (abs % bs) as usize;
+        // Clamp to the block end, and to what the region actually holds.
+        let n = max
+            .min(bs as usize - inb)
+            .min((r.len - off).min(usize::MAX as u64) as usize);
+        if n == 0 {
+            return Err(LoomError::OutOfBounds {
+                region: r.id,
+                offset: off,
+                len: max as u64,
+                region_len: r.len,
+            });
+        }
+        let frame = self.ensure_resident(block, full_overwrite && inb == 0 && n == bs as usize)?;
+        Ok((frame, inb, n))
     }
 
     // ---- data path ------------------------------------------------------
@@ -568,6 +835,7 @@ mod tests {
             &p,
             OpenOptions {
                 budget: Some(BS as u64),
+                prefetch_depth: None,
             },
         )
         .unwrap();
@@ -673,6 +941,237 @@ mod tests {
         assert_eq!(l.frame_count(), 7);
         assert_eq!(l.info().unwrap().hot_bytes_allocated, 7 * BS as u64);
         drop(l);
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn zero_copy_agrees_with_copying_read_and_persists() {
+        let p = tmp("zerocopy");
+        let expect: Vec<u8> = (0..BS as usize).map(|i| (i * 31 % 251) as u8).collect();
+        {
+            let mut l = create(&p, 32 * BS as u64, 4 * BS as u64);
+            let r = l.alloc(16 * BS as u64).unwrap();
+            // Write via the zero-copy path.
+            let n = l
+                .with_slice_mut(r, 5 * BS as u64, BS as usize, |dst| {
+                    dst.copy_from_slice(&expect);
+                    dst.len()
+                })
+                .unwrap();
+            assert_eq!(n, BS as usize, "whole block should be contiguous");
+            // Force it out of RAM entirely, then read it back both ways.
+            l.evict_all().unwrap();
+            l.debug_scribble_free_frames(0x77);
+            let mut copied = vec![0u8; BS as usize];
+            l.read(r, 5 * BS as u64, &mut copied).unwrap();
+            assert_eq!(pattern::first_mismatch(&expect, &copied), None);
+            l.evict_all().unwrap();
+            l.debug_scribble_free_frames(0x88);
+            let borrowed = l
+                .with_slice(r, 5 * BS as u64, BS as usize, |src| src.to_vec())
+                .unwrap();
+            assert_eq!(pattern::first_mismatch(&expect, &borrowed), None);
+            assert!(l.stats().zero_copy >= 2);
+            l.close().unwrap();
+        }
+        // And across a reopen, so the dirty flag really was set.
+        let mut l = Loom::open(&p, OpenOptions::default()).unwrap();
+        let r = l.regions()[0];
+        let got = l
+            .with_slice(r, 5 * BS as u64, BS as usize, |src| src.to_vec())
+            .unwrap();
+        assert_eq!(pattern::first_mismatch(&expect, &got), None);
+        l.close().unwrap();
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn zero_copy_stops_at_the_block_boundary() {
+        let p = tmp("zerocopy-bound");
+        let mut l = create(&p, 8 * BS as u64, 2 * BS as u64);
+        let r = l.alloc(4 * BS as u64).unwrap();
+        // Ask for two blocks' worth starting 100 bytes in; must be clamped.
+        let got = l.with_slice(r, 100, 2 * BS as usize, |s| s.len()).unwrap();
+        assert_eq!(got, BS as usize - 100);
+        l.close().unwrap();
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    /// The dangerous case. A dirty frame is the ONLY copy of those bytes;
+    /// a speculative read that overwrote it would destroy data silently.
+    #[test]
+    fn prefetch_never_clobbers_a_dirty_frame() {
+        let p = tmp("prefetch-dirty");
+        let precious = vec![0xABu8; BS as usize];
+        let mut l = Loom::create(
+            &p,
+            CreateOptions {
+                capacity: 256 * BS as u64,
+                block_size: BS,
+                budget: 32 * BS as u64,
+            },
+        )
+        .unwrap();
+        let r = l.alloc(200 * BS as u64).unwrap();
+        // Lay down a pattern everywhere so reads have something to verify.
+        let mut scratch = vec![0u8; BS as usize];
+        for b in 0..200u64 {
+            pattern::fill(9, b'P', b, &mut scratch);
+            l.write(r, b * BS as u64, &scratch).unwrap();
+        }
+        l.sync().unwrap();
+        l.evict_all().unwrap();
+
+        // Dirty exactly one block, in the middle of what we are about to scan.
+        l.write(r, 60 * BS as u64, &precious).unwrap();
+        assert_eq!(l.dirty_blocks(), 1);
+
+        // Now scan sequentially straight through it. This is the pattern
+        // that triggers prefetch batches covering block 60.
+        for b in 50..80u64 {
+            pattern::fill(9, b'P', b, &mut scratch);
+            let mut got = vec![0u8; BS as usize];
+            l.read(r, b * BS as u64, &mut got).unwrap();
+            if b == 60 {
+                // Still the dirty bytes, NOT what is on disk.
+                assert_eq!(
+                    pattern::first_mismatch(&precious, &got),
+                    None,
+                    "prefetch clobbered a dirty frame: block 60 lost its unflushed bytes"
+                );
+            } else {
+                assert_eq!(pattern::first_mismatch(&scratch, &got), None, "block {b}");
+            }
+        }
+        assert!(
+            l.stats().prefetch_batches > 0,
+            "sequential scan should have triggered prefetch; counters: {}",
+            l.stats().render()
+        );
+        // And the dirty bytes survive a real round trip.
+        l.sync().unwrap();
+        l.evict_all().unwrap();
+        let mut got = vec![0u8; BS as usize];
+        l.read(r, 60 * BS as u64, &mut got).unwrap();
+        assert_eq!(pattern::first_mismatch(&precious, &got), None);
+        l.close().unwrap();
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    /// Prefetch must cut the number of device round-trips on a sequential
+    /// scan, and must be switchable off so the claim is measurable.
+    #[test]
+    fn prefetch_cuts_device_round_trips_and_can_be_disabled() {
+        let p = tmp("prefetch-count");
+        {
+            let mut l = Loom::create(
+                &p,
+                CreateOptions {
+                    capacity: 512 * BS as u64,
+                    block_size: BS,
+                    budget: 64 * BS as u64,
+                },
+            )
+            .unwrap();
+            let r = l.alloc(400 * BS as u64).unwrap();
+            let mut scratch = vec![0u8; BS as usize];
+            for b in 0..400u64 {
+                pattern::fill(3, b'Q', b, &mut scratch);
+                l.write(r, b * BS as u64, &scratch).unwrap();
+            }
+            l.close().unwrap();
+        }
+        let scan = |depth: Option<usize>| -> (u64, u64, u64) {
+            let mut l = Loom::open(
+                &p,
+                OpenOptions {
+                    budget: Some(64 * BS as u64),
+                    prefetch_depth: depth,
+                },
+            )
+            .unwrap();
+            let r = l.regions()[0];
+            let mut scratch = vec![0u8; BS as usize];
+            let mut got = vec![0u8; BS as usize];
+            for b in 0..400u64 {
+                pattern::fill(3, b'Q', b, &mut scratch);
+                l.read(r, b * BS as u64, &mut got).unwrap();
+                assert_eq!(pattern::first_mismatch(&scratch, &got), None, "block {b}");
+            }
+            let st = l.stats().clone();
+            l.close().unwrap();
+            (st.prefetch_batches, st.prefetch_blocks, st.prefetch_used)
+        };
+
+        let (off_batches, _, _) = scan(Some(0));
+        assert_eq!(off_batches, 0, "prefetch_depth 0 must issue no batches");
+
+        let (batches, blocks, used) = scan(None);
+        assert!(
+            batches > 0,
+            "default prefetch should batch a sequential scan"
+        );
+        assert!(blocks > 0);
+        // A pure forward scan is the best case: almost every speculative
+        // block should be asked for. Assert most, not all — the first two
+        // blocks precede run detection and the tail is clamped.
+        assert!(
+            used * 10 >= blocks * 8,
+            "prefetch was mostly wasted: {used} of {blocks} used"
+        );
+        // 400 blocks in `batches` reads is the whole point.
+        assert!(
+            batches < 200,
+            "expected far fewer batches than blocks, got {batches}"
+        );
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    /// A speculative read must not report corruption the caller never asked
+    /// about — but the moment they DO ask, it must be reported.
+    #[test]
+    fn prefetch_defers_corruption_until_the_block_is_asked_for() {
+        let p = tmp("prefetch-corrupt");
+        let bad_block;
+        {
+            let mut l = Loom::create(
+                &p,
+                CreateOptions {
+                    capacity: 128 * BS as u64,
+                    block_size: BS,
+                    budget: 16 * BS as u64,
+                },
+            )
+            .unwrap();
+            let r = l.alloc(100 * BS as u64).unwrap();
+            let mut scratch = vec![0u8; BS as usize];
+            for b in 0..100u64 {
+                pattern::fill(5, b'R', b, &mut scratch);
+                l.write(r, b * BS as u64, &scratch).unwrap();
+            }
+            bad_block = l.block_of_region_offset(r, 40 * BS as u64);
+            let off = l.backing_offset_of_block(bad_block);
+            l.close().unwrap();
+            use std::io::{Seek, SeekFrom, Write as _};
+            let mut f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+            f.seek(SeekFrom::Start(off + 77)).unwrap();
+            f.write_all(&[0xFF]).unwrap();
+            f.sync_all().unwrap();
+        }
+        let mut l = Loom::open(&p, OpenOptions::default()).unwrap();
+        let r = l.regions()[0];
+        let mut got = vec![0u8; BS as usize];
+        // Scan up to (not into) the bad block — prefetch will have spanned
+        // it, and must not have failed the run.
+        for b in 30..40u64 {
+            l.read(r, b * BS as u64, &mut got).unwrap();
+        }
+        // Now ask for it directly. Now it must be reported.
+        match l.read(r, 40 * BS as u64, &mut got) {
+            Err(LoomError::Corrupt { block, .. }) => assert_eq!(block, bad_block),
+            other => panic!("corruption not reported when asked for: {other:?}"),
+        }
+        l.close().unwrap();
         std::fs::remove_file(&p).unwrap();
     }
 }

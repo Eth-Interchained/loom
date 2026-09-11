@@ -2,6 +2,71 @@
 
 Every number below is copied verbatim from `loom prove` output. Nothing is rounded.
 
+## 2026-09-11 — prefetch and zero-copy, measured A/B (Hyperagent sandbox, Linux/ext4)
+
+Added after the iMac run identified queue depth 1 as the ceiling. `--prefetch 0`
+vs the default 16, everything else identical.
+
+```
+=== --prefetch 0 ===
+    prefetch depth in force: 0 blocks (disabled)
+[3] wrote pattern A: 6.00 GiB in 10.51s (584.8 MiB/s)
+    read A back: 98304 blocks in 10.98s (559.7 MiB/s), 0 mismatching, hits during pass: 0
+      prefetch: 0 batches, 0 blocks, 0 later used (n/a — prefetch issued nothing)
+    reopened; read B back: 98304 blocks in 10.57s (581.5 MiB/s), 0 mismatching
+    loom  20000 ops in 0.42s (47577 ops/s) p50<=6.1us p99<=81.9us max=331.5us hit 70.1%
+
+=== --prefetch 16 ===
+    prefetch depth in force: 16 blocks (one 1.0 MiB read per batch)
+[3] wrote pattern A: 6.00 GiB in 10.45s (588.1 MiB/s)
+    read A back: 98304 blocks in 8.86s (693.5 MiB/s), 0 mismatching, hits during pass: 81918
+      prefetch: 5462 batches, 87392 blocks, 81918 later used (93.7% useful)
+    reopened; read B back: 98304 blocks in 8.26s (744.1 MiB/s), 0 mismatching
+    loom  20000 ops in 0.43s (46546 ops/s) p50<=6.1us p99<=81.9us max=122.5us hit 70.1%
+```
+
+|              | off | on | |
+|--------------|-----|----|-|
+| read A | 559.7 MiB/s | **693.5 MiB/s** | 1.24x |
+| read B | 581.5 MiB/s | **744.1 MiB/s** | 1.28x |
+| skewed (random) workload | 0.42 s | 0.43 s | unchanged |
+| speculation useful | — | **93.7%** | |
+
+- **Device round-trips: 98,304 -> ~16,400** (5,462 batches plus the singles
+  that precede run detection). A 6x reduction.
+- **Only 1.24x throughput here**, because a miss on this device costs 65 us —
+  the round-trip was never the bottleneck. The gain is bounded by what the
+  device charges per trip.
+- **On the iMac a miss costs 10.49 ms.** Same 6x reduction in trips against a
+  per-trip cost ~160x higher. That is a prediction, not a result, and it is
+  the next thing to measure on real hardware.
+- **The random workload is unchanged**, which is the important negative
+  result: run detection (3 consecutive missed blocks) correctly declines to
+  speculate on random access, so prefetch costs nothing where it cannot help.
+
+### A defect this A/B found
+
+The first attempt at this measurement reported `5462 batches` for
+`--prefetch 0`. `Loom::create` hardcoded `OpenOptions::default()`, so the
+freshly created arena always got default prefetch regardless of what the
+caller asked for; only the reopened instance honoured the flag. Fixed by
+adding `create_with`. A measurement of "feature off" that silently runs the
+feature is worse than no measurement.
+
+### And a correctness bug prefetch exposed, found by running it
+
+The sequential-scan test failed on block 110 — `2 + 18x6`, a batch start,
+which pointed straight at the claim loop. `FramePool::take_free_or_clean`
+returned a frame **without detaching it**, so as the CLOCK hand wrapped
+inside a single 16-block claim loop it handed out the same frame twice: two
+blocks mapped to one frame, one returning the other's bytes. Silent wrong
+data, and it would never have appeared in a single-block miss path.
+
+Fixed at the source — the function now detaches and reports the outgoing
+block, making a double hand-out structurally impossible. Verified by
+re-introducing the bug: 2 tests fail (the unit property test and the
+end-to-end scan), then pass again once restored.
+
 ## 2026-09-11 — Mark's iMac (Intel, macOS, APFS, 957 GB internal volume)
 
 The first run on real macOS: `F_NOCACHE`, `F_FULLFSYNC` and
