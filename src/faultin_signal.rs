@@ -27,12 +27,31 @@
 //! is written here rather than buried.
 //!
 //! Two consequences taken seriously:
-//! - The handler allocates **nothing**. Every buffer it touches is
-//!   preallocated at setup. A `malloc` inside a handler that interrupted
+//! - The handler's **own** state is fully preallocated — `state`, `ring` and
+//!   `staging` are allocated at install time, so the handler never allocates
+//!   for its bookkeeping. A `malloc` inside a handler that interrupted
 //!   `malloc` is a deadlock.
 //! - The handler takes no lock the faulting thread could already hold. A
 //!   single spin lock guards the arena state and is held only for the few
 //!   instructions that mutate it.
+//!
+//! # Two known risks, stated rather than papered over
+//!
+//! 1. **The resolve path calls `Loom::read`/`Loom::write`, and those can
+//!    allocate** (the prefetch batcher builds a small `Vec`). So "the
+//!    handler allocates nothing" is true of Loom's fault bookkeeping and
+//!    **false** of the I/O beneath it. Give the `Loom` under a fault arena
+//!    `prefetch_depth: Some(0)` to remove that path; `loom faultin` does.
+//! 2. **The handler runs on the faulting thread's stack** (see the
+//!    `SA_ONSTACK` note at the install site — using the alternate stack
+//!    crashes outright). A thread that faults while nearly out of stack
+//!    would overflow.
+//!
+//! Both have the same real fix, and it is not built: make the handler a
+//! **notify-and-wait** — park the fault, let a worker thread with its own
+//! full stack and its own allocator do the I/O, and wake the faulting
+//! thread. That is also the design the macOS Mach exception port wants.
+//! Until then these are the honest limits of this backend.
 //!
 //! # State machine (identical to the `userfaultfd` backend)
 //!
@@ -585,7 +604,26 @@ impl SignalFaultArena {
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = handler as *const () as usize;
-            sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+            // NOT `SA_ONSTACK`, and this is load-bearing.
+            //
+            // Rust's runtime installs a per-thread `sigaltstack` for its own
+            // stack-overflow detection, and it is only a few KB. With
+            // `SA_ONSTACK` the kernel runs this handler on that tiny stack,
+            // where the resolve path — which calls into `Loom` and its
+            // buffers — overflows it. A stack overflow INSIDE a SIGSEGV
+            // handler is unrecoverable: the process dies instantly.
+            //
+            // Measured: with `SA_ONSTACK` the debug build died with SIGSEGV
+            // on the first arena fault while release survived, because
+            // release frames are small enough to fit. Exactly the shape of
+            // bug that an optimised build hides.
+            //
+            // Without it the handler runs on the faulting thread's own
+            // stack, which has megabytes. The residual risk is a thread
+            // whose stack is already nearly exhausted; the fix for that is
+            // the worker-thread design named in the module docs, not a
+            // bigger altstack.
+            sa.sa_flags = libc::SA_SIGINFO;
             libc::sigemptyset(&mut sa.sa_mask);
             let mut old: libc::sigaction = std::mem::zeroed();
             // SAFETY: sa and old are correctly initialised sigaction values.
