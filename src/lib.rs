@@ -36,6 +36,8 @@ pub mod checksum;
 pub mod error;
 #[cfg(target_os = "linux")]
 pub mod faultin;
+#[cfg(unix)]
+pub mod faultin_signal;
 pub mod footprint;
 pub mod frames;
 pub mod io;
