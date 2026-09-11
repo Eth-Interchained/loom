@@ -39,6 +39,7 @@ What v0 **does**:
 - Its own footprint witness: `phys_footprint` + `compressed` via `task_info` on macOS, `RssAnon+RssShmem` (+`RssFile`, `VmRSS`) on Linux.
 - **Zero-copy access** (`with_slice` / `with_slice_mut`): borrow the frame's bytes in place. Soundness from the borrow checker, not a pin count — the closure runs while `&mut self` is held, so nothing can evict underneath it. No `unsafe`.
 - **Prefetch**: on a sequential run, one `pread` covering up to 16 blocks instead of 16 separate reads. Speculative loads take only free or clean frames, never clobber a resident block, zero-fill never-written blocks, and defer corruption reports until the block is actually asked for. `prefetch_used / prefetch_blocks` reports how often the guess was wanted, so "it helped" is measured rather than assumed.
+- **Transparent fault-in (Linux, `userfaultfd`)**: `FaultArena` hands the program a plain `*mut u8` spanning the whole arena. It dereferences normally; Loom runs only on faults. **Once a page is mapped a hit costs nothing** — no bookkeeping, no copy, no Loom code in the path. Exact dirty tracking via write-protect faults: a read-only pass produces zero write faults.
 - Hit and miss latency histograms kept **separate**. They are never averaged.
 - Progress reporting during long passes, so a slow device is never mistaken for a hang.
 
@@ -46,7 +47,9 @@ What v0 **does not do** (stated, not implied):
 
 - **Crash consistency.** A crash between `sync`s can leave blocks written whose checksums were not; those blocks then read as `Corrupt`. Detected, not recovered. No log, no atomic table updates.
 - **Free.** Regions are never released. The table is fixed at 4095 regions.
-- **Compression, device profiling, HDD-specific extents, `loom stats`, memory-pressure response, Linux as a first-class target, any binding other than Rust.**
+- **Compression, device profiling, HDD-specific extents, `loom stats`, memory-pressure response, any binding other than Rust.**
+- **Transparent fault-in on macOS.** The Linux `userfaultfd` backend is proven; the macOS equivalent (a Mach exception port for `EXC_BAD_ACCESS` on a dedicated thread) is designed but **not written and not run**. Same architecture, different fault transport.
+- **Injection into another process.** `FaultArena` covers an arena in *this* process. Getting Loom into a program you didn't write needs `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`, which is not built — and on macOS is refused for hardened-runtime binaries (so Google Chrome as shipped is out of reach; a Chromium you build yourself is not).
 - **Concurrency.** One synchronous I/O at a time — queue depth 1. See below; it is the known ceiling.
 - **Holding two blocks at once.** The zero-copy borrow is one block, scoped to a closure. The explicit pin-count API that would allow more is not built.
 - **Residency guarantees.** Loom bounds what it *allocates*. The OS may still compress or swap those frames; Loom reports that (`compressed` on macOS) instead of denying it. `mlock` is deliberately not on by default.
@@ -96,6 +99,13 @@ arena.write(region, offset, &data)?;
 arena.read(region, offset, &mut buf)?;
 arena.sync()?;   // writeback + tables + full fsync
 arena.close()?;  // sync, then close; errors are returned, not swallowed
+```
+
+```rust
+// Transparent: a real pointer over an arena larger than RAM (Linux).
+let fa = FaultArena::new(arena, region, FaultOptions::new(80 * GIB as usize, 8 * GIB as usize))?;
+let p = fa.as_ptr();
+unsafe { *p.add(70_000_000_000) = 0x42; }   // just works; Loom faults it in
 ```
 
 ```rust
