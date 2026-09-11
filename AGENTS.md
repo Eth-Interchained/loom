@@ -37,6 +37,8 @@ Real-device proof (exit 0 pass / 1 fail; last line is the verdict):
 | `src/footprint.rs` | the budget's witness: `phys_footprint`/`compressed`/`resident_size` (macOS), `RssAnon+RssShmem`/`RssFile`/`VmRSS` (Linux) |
 | `src/stats.rs` | counters + log-scale latency histograms; hit and miss never merged |
 | `src/pattern.rs` | deterministic block content for proofs (regenerated, never stored) |
+| `src/faultin.rs` | **Linux only.** Transparent fault-in over `userfaultfd` (MISSING\|WP): raw pointer, handler thread, exact dirty tracking, bounded residency |
+| `src/faultin_signal.rs` | **macOS + Linux.** Same architecture over `SIGSEGV`/`SIGBUS` + `mprotect`. Handler allocates nothing, spin-locked state, chains to the previous disposition. One arena per process |
 | `src/prove.rs` | the experiment; `run(&ProveConfig, &mut dyn Write) -> Report` |
 | `src/bin/loom.rs` | `init` / `info` / `prove`; hand-parsed args |
 | `tests/prove.rs` | the experiment at test scale (256 MiB arena / 8 MiB budget) |
@@ -53,7 +55,13 @@ Real-device proof (exit 0 pass / 1 fail; last line is the verdict):
 8. `prove` fails on the first false claim; the verdict sentence contains only measured values.
 9. `FramePool::take_free_or_clean` **detaches** the frame before returning and reports the outgoing block; the caller must clear that block's map entry. Not tidiness — a caller claiming several frames in a loop would otherwise be handed the same still-attached frame twice as the CLOCK hand wraps, mapping two blocks to one frame and silently returning the wrong bytes. Regression-tested at both the unit and scan level.
 10. Speculative (prefetch) loads may never write: free or clean frames only, never clobber a resident block, zero-fill a never-written block rather than trusting the disk, and never surface a checksum error for a block the caller did not ask for.
-11. An option a caller passes must reach the object they get. `Loom::create` delegates to `create_with`; substituting defaults on the create path made a "prefetch disabled" measurement report prefetch running.
+11. An unresolvable fault leaves the faulting thread **blocked** and records the address and reason in `FaultStats::failures`. Waking it onto bytes we failed to load would hand it silent garbage; a hang that says why beats corruption that doesn't.
+12. `FaultArena::drop` flushes dirty extents **before** stopping the handler and unmapping, and joins the handler before `munmap` — unmapping under a live handler would be a use-after-free of the mapping.
+13. The signal handler must **NOT** set `SA_ONSTACK`. Rust's runtime installs a few-KB per-thread `sigaltstack`; with `SA_ONSTACK` the kernel runs our handler there and the resolve path (which calls into `Loom`) overflows it. A stack overflow inside a SIGSEGV handler is unrecoverable — instant process death. **Measured: the debug build died on the first arena fault while release survived**, because release frames fit. `cargo test` in **debug** is what catches this, so CI must keep running the debug tier.
+14. The signal handler preallocates its own bookkeeping (`state`, `ring`, `staging`) and takes no lock the faulting thread could hold. Note the honest limit: the resolve path calls `Loom::read`/`write`, **which can allocate** (the prefetch batcher's `Vec`). Pass `prefetch_depth: Some(0)` to a `Loom` under a fault arena. The real fix for both this and the stack risk is a notify-and-wait handler with a worker thread — not built.
+15. The signal handler **chains** to the saved previous disposition for any fault outside `[BASE, END)` and for any fault it cannot resolve. Swallowing another subsystem's `SIGSEGV` silently breaks crash reporting process-wide. `Drop` disarms (`BASE = 0`) *before* restoring dispositions and unmapping.
+16. When stacking a fault arena on a `Loom`, the `Loom` frame budget must be SMALL — the arena's mapped pages are the cache; Loom is the I/O path. Equal budgets stack and double the footprint (measured 257.8 MiB for a stated 128 MiB).
+17. An option a caller passes must reach the object they get. `Loom::create` delegates to `create_with`; substituting defaults on the create path made a "prefetch disabled" measurement report prefetch running.
 
 ## Extending
 
@@ -61,6 +69,8 @@ Real-device proof (exit 0 pass / 1 fail; last line is the verdict):
 - New backend (e.g. Linux `io_uring`) → new `cfg` arm in `io.rs`; keep the `Backing` API.
 - New on-disk fields → bump `FORMAT_VERSION` in `superblock.rs`; `decode` must reject older/newer.
 - Level 2 (`pin` handles) belongs in `arena.rs` as a guard type that increments a pin count `choose_victim` must respect.
+- macOS fault-in: add a `faultin_mach.rs` with the same `FaultArena` surface. Save and CHAIN the previous exception ports (`task_get_exception_ports` first) — swallowing another subsystem's `EXC_BAD_ACCESS` silently breaks crash reporting and `lldb` for the whole process.
+- `userfaultfd` needs `CAP_SYS_PTRACE` when `vm.unprivileged_userfaultfd=0` (the default on many kernels, including this sandbox's 6.18). Deployment detail, not a code one.
 
 ## Release
 

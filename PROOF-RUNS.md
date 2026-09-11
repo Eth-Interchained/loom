@@ -2,6 +2,158 @@
 
 Every number below is copied verbatim from `loom prove` output. Nothing is rounded.
 
+## 2026-09-11 — `loom faultin`: 2 GiB addressed through a raw pointer in 129 MiB of RAM
+
+The signal backend (`SIGSEGV`/`SIGBUS` + `mprotect`) — **the same code that runs
+on macOS**, executed here on Linux. `loom faultin` is the demonstration
+command: it seeds an arena with a verifiable pattern, hands out a raw
+pointer, walks the whole thing with ordinary dereferences, and reports.
+
+```
+$ loom faultin --pool /agent/workspace/fi2.pool --arena 2G --budget 128M
+
+LOOM FAULTIN  arena=2.00 GiB  extent=64.0 KiB
+  RAM: 128.0 MiB mapped arena + 256.0 KiB Loom staging = 128.2 MiB total budget
+[0] process footprint before Loom: 140.0 KiB
+[1] seeded 2.00 GiB in 4.0s (513.6 MiB/s)
+[2] arena mapped at 0x7f366c200000: 2.00 GiB addressable, 128.0 MiB may be
+    resident (16.0x over budget)
+[3] read 2.00 GiB in 5.8s (352.6 MiB/s), 0 mismatching blocks
+    load faults: 32768  write faults: 0  evictions: 30720 (0 wrote back)
+    resident: 2048 extents (128.0 MiB)  peak: 2048 (128.0 MiB)
+[4] warm pass over 128.0 MiB: first 223.698ms, second 0.966ms;
+    load faults 32768 -> 34816 -> 34816
+    the second pass took ZERO further faults — a hit runs no Loom code at all
+[5] process footprint after: 129.1 MiB
+    against a combined budget of 128.2 MiB -> within bound
+
+RESULT: addressed 2.00 GiB of memory through a plain pointer while never
+mapping more than 128.0 MiB. Every byte verified. 34816 faults, 32768
+evictions, 0 writebacks, 0 failures.
+```
+
+### A defect this demo found, and it was doubling the budget
+
+The first run reported **`process footprint after: 257.8 MiB` for a stated
+128 MiB budget.** Two caches for one budget: the fault arena's mapped pages
+are the cache, and the `Loom` underneath it had *also* been given a 128 MiB
+frame pool, even though it is only the I/O path. Giving Loom 256 KiB of
+staging instead brought the footprint to **129.1 MiB** against a 128.2 MiB
+combined bound.
+
+Worth naming because the run "passed" both times. Nothing crashed, every
+byte verified, and the headline number was true — it was the *cost* that was
+double what was claimed. `loom faultin` now prints the combined bound and
+checks the measured footprint against it, so the arithmetic cannot drift
+again.
+
+### The bug CI caught that my local gate missed
+
+The first push of the signal backend **failed ubuntu CI with `signal: 11,
+SIGSEGV`** — a crash, not an assertion — while my local `cargo fmt` /
+`clippy` / `cargo test --release` gate was green.
+
+Root cause: the handler was installed with `SA_ONSTACK`. **Rust's runtime
+already installs a few-KB per-thread `sigaltstack`** for its own
+stack-overflow detection, so `SA_ONSTACK` ran our handler on that tiny
+stack — and the resolve path calls into `Loom`, whose call chain overflows
+it. A stack overflow inside a SIGSEGV handler is unrecoverable.
+
+Why release hid it: smaller stack frames fit in the altstack. **Debug frames
+did not.** Verified by re-introducing `SA_ONSTACK` (debug dies with SIGSEGV)
+and removing it again (4 consecutive clean debug runs, then 5 more).
+
+Diagnosis was by raw `write(2)` markers in the handler — the only
+async-signal-safe way to see inside it — which printed
+`[H:in][R:absent][R:loom.read..` and then died, pointing straight at the
+call into `Loom` rather than at the fault itself. gdb alone was misleading:
+it stops on the *first* arena fault, which is the normal, expected one.
+
+Two lessons recorded in AGENTS.md as invariants: never `SA_ONSTACK` here,
+and **CI must keep running the debug tier** — release-only testing would not
+have caught this.
+
+One loose end, stated rather than dismissed: the run immediately after the
+deliberately-crashed process reported `1 failed` without my capturing which
+test. It has not reproduced in 8 subsequent runs. Probably residue from the
+killed process; unexplained either way.
+
+### Not established
+
+- **No line of this has run on macOS.** The signal backend is the same code
+  on both platforms by construction, and both apple-darwin targets check
+  clean, but checking is not running.
+- A signal handler calling `mprotect` is outside POSIX's async-signal-safe
+  list. It is how JITs and GCs did lazy paging for decades; it is not a
+  guarantee. Mach exception ports are the clean macOS mechanism and are not
+  written.
+- One arena per process; the handler locates its arena from the faulting
+  address alone, so a second install is refused rather than silently sharing.
+- FIFO eviction, not CLOCK. Simple, and labelled simple.
+
+## 2026-09-11 — transparent fault-in, proven (Hyperagent sandbox, Linux 6.18, `userfaultfd`)
+
+The mechanism that turns Loom from a library you call into memory a program
+just has. A raw `*mut u8` over an arena much larger than the mapped budget,
+dereferenced with ordinary loads and stores.
+
+```
+$ cargo test --release --lib faultin -- --nocapture
+
+a_hit_costs_nothing_because_no_loom_code_runs
+  cold pass 1.774576ms (563.5 MiB/s), warm pass 829ns -> faults unchanged at 16
+
+raw_pointer_reads_are_correct_and_residency_stays_bounded
+  load faults: 256  write faults: 0  evictions: 240 (0 needed writeback)
+  resident: 16 extents (1.0 MiB)  peak: 1.0 MiB
+  load latency: n=256 p50<=81.9us p99<=159.3us max=159.3us mean=75.1us
+  wp   latency: n=0 (no samples)
+
+raw_pointer_writes_are_tracked_and_persist
+  load faults: 128  write faults: 128  evictions: 120 (120 needed writeback)
+  resident: 8 extents (512.0 KiB)  peak: 512.0 KiB
+  load latency: n=128 p50<=163.8us p99<=196.6us max=262.7us mean=131.9us
+  wp   latency: n=128 p50<=6.1us p99<=9.0us max=9.0us mean=5.8us
+
+4 passed
+```
+
+### What this establishes
+
+1. **A 16 MiB arena addressed through a raw pointer with 1 MiB mapped**, every
+   byte correct, peak residency exactly the budget. No Loom API calls in the
+   test's hot loop — just pointer dereferences.
+2. **A hit costs nothing.** The warm pass took **zero additional faults**
+   (16 before, 16 after) and ran in 829 us vs 1.77 ms cold. Caveat stated
+   plainly: the scan touches 2 bytes per 4 KiB chunk, so the warm pass is
+   running out of L2/L3 — the throughput figure is cache speed, not memory
+   bandwidth. **The load-bearing evidence is the unchanged fault count**, which
+   proves there is no Loom code in the hit path at all.
+3. **Dirty tracking is exact.** The read-only pass produced **0 write faults**;
+   the write pass produced exactly one WP fault per written extent (128/128)
+   and wrote back exactly the dirty ones (120/120). No "assume everything
+   touched was written."
+4. **A WP fault costs ~6 us** (p50 6.1 us, mean 5.8 us). That is the price of
+   exact dirty tracking. Against the iMac's measured 10.49 ms disk read it is
+   0.06% — free. Against NVMe at ~15 us it would be ~40% — which is why this
+   mechanism suits slow backing storage specifically.
+5. **Writeback does not damage neighbours.** The write test stamps 8 bytes into
+   each block and then asserts the *other* 65,528 bytes still hold the original
+   pattern after eviction and reload.
+
+### Not established
+
+- **macOS.** No `userfaultfd` there; the Mach exception-port equivalent is
+  designed but unwritten and unrun. The architecture is identical; only the
+  fault transport differs.
+- **Injection.** This covers an arena in the *current* process. Getting into a
+  program you did not write needs `LD_PRELOAD` / `DYLD_INSERT_LIBRARIES`,
+  neither built. On macOS, hardened-runtime binaries refuse it outright.
+- **Concurrency.** One handler thread serialises faults. A real ceiling.
+- **Permissions.** This kernel reports `vm.unprivileged_userfaultfd = 0`, yet
+  the syscall succeeded for this process. Not chased down; on a VPS a
+  non-root process may need `sysctl vm.unprivileged_userfaultfd=1`.
+
 ## 2026-09-11 — prefetch and zero-copy, measured A/B (Hyperagent sandbox, Linux/ext4)
 
 Added after the iMac run identified queue depth 1 as the ceiling. `--prefetch 0`

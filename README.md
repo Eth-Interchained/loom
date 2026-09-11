@@ -39,6 +39,8 @@ What v0 **does**:
 - Its own footprint witness: `phys_footprint` + `compressed` via `task_info` on macOS, `RssAnon+RssShmem` (+`RssFile`, `VmRSS`) on Linux.
 - **Zero-copy access** (`with_slice` / `with_slice_mut`): borrow the frame's bytes in place. Soundness from the borrow checker, not a pin count — the closure runs while `&mut self` is held, so nothing can evict underneath it. No `unsafe`.
 - **Prefetch**: on a sequential run, one `pread` covering up to 16 blocks instead of 16 separate reads. Speculative loads take only free or clean frames, never clobber a resident block, zero-fill never-written blocks, and defer corruption reports until the block is actually asked for. `prefetch_used / prefetch_blocks` reports how often the guess was wanted, so "it helped" is measured rather than assumed.
+- **Transparent fault-in — a real pointer over an arena larger than RAM.** Two backends, same architecture and same state machine: `faultin` (Linux, `userfaultfd`) and `faultin_signal` (**macOS *and* Linux**, `SIGSEGV`/`SIGBUS` + `mprotect`). The program gets a plain `*mut u8` and dereferences it normally; Loom runs only on faults. **Once a page is mapped a hit costs nothing** — no bookkeeping, no copy, no Loom code in the path at all. Dirty tracking is exact: a read-only pass produces zero write faults and zero writebacks.
+- **`loom faultin`** — the demonstration. Addresses an arena many times the RAM budget through a raw pointer, verifies every byte, and reports faults, peak residency and the warm-pass cost.
 - Hit and miss latency histograms kept **separate**. They are never averaged.
 - Progress reporting during long passes, so a slow device is never mistaken for a hang.
 
@@ -46,7 +48,10 @@ What v0 **does not do** (stated, not implied):
 
 - **Crash consistency.** A crash between `sync`s can leave blocks written whose checksums were not; those blocks then read as `Corrupt`. Detected, not recovered. No log, no atomic table updates.
 - **Free.** Regions are never released. The table is fixed at 4095 regions.
-- **Compression, device profiling, HDD-specific extents, `loom stats`, memory-pressure response, Linux as a first-class target, any binding other than Rust.**
+- **Compression, device profiling, HDD-specific extents, `loom stats`, memory-pressure response, any binding other than Rust.**
+- **Mach exception ports.** The signal backend runs on macOS and is the same code proven on Linux, but a signal handler calling `mprotect` is outside POSIX's async-signal-safe list (it is how JITs and GCs did lazy paging for decades; it is not a guarantee). The clean macOS mechanism is a Mach exception port on a dedicated thread — designed, **not written**. Hardening step, once there is a number from real macOS hardware.
+- **Verification on macOS.** Everything here is executed on Linux. Not one line has run on a Mac.
+- **Injection into another process.** `FaultArena` covers an arena in *this* process. Getting Loom into a program you didn't write needs `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`, which is not built — and on macOS is refused for hardened-runtime binaries (so Google Chrome as shipped is out of reach; a Chromium you build yourself is not).
 - **Concurrency.** One synchronous I/O at a time — queue depth 1. See below; it is the known ceiling.
 - **Holding two blocks at once.** The zero-copy borrow is one block, scoped to a closure. The explicit pin-count API that would allow more is not built.
 - **Residency guarantees.** Loom bounds what it *allocates*. The OS may still compress or swap those frames; Loom reports that (`compressed` on macOS) instead of denying it. `mlock` is deliberately not on by default.
@@ -97,6 +102,20 @@ arena.read(region, offset, &mut buf)?;
 arena.sync()?;   // writeback + tables + full fsync
 arena.close()?;  // sync, then close; errors are returned, not swallowed
 ```
+
+```sh
+# The demonstration: address 32 GiB through a pointer with a 2 GiB RAM budget.
+loom faultin --pool ~/loom.pool --arena 32G --budget 2G
+```
+
+```rust
+// Transparent: a real pointer over an arena larger than RAM (macOS + Linux).
+let fa = SignalFaultArena::new(arena, region, SignalFaultOptions::new(80*GIB, 8*GIB))?;
+let p = fa.as_ptr();
+unsafe { *p.add(70_000_000_000) = 0x42; }   // just works; Loom faults it in
+```
+
+**Budget stacking, learned the hard way:** the fault arena's mapped pages *are* the cache, so the `Loom` underneath it must be given a **small** frame budget — it is only the I/O path. Sized equally, the two tiers stack and the process uses twice the stated budget (measured: a 128 MiB arena budget over a 128 MiB Loom pool gave a 257.8 MiB footprint; with 256 KiB of staging it gave 129.1 MiB). `loom faultin` prints the combined bound and checks the footprint against it.
 
 ```rust
 // Zero copy: borrow the bytes where they already live.
