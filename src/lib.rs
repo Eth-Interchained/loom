@@ -34,6 +34,8 @@ pub mod aligned;
 pub mod arena;
 pub mod checksum;
 pub mod error;
+#[cfg(target_os = "linux")]
+pub mod faultin;
 pub mod footprint;
 pub mod frames;
 pub mod io;
