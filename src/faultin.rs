@@ -758,6 +758,29 @@ mod tests {
 
     const BS: u32 = 64 * 1024;
 
+    /// `userfaultfd` needs `CAP_SYS_PTRACE` when
+    /// `vm.unprivileged_userfaultfd = 0`, which is the default on many
+    /// kernels including GitHub's runners. An unavailable capability is not
+    /// a broken implementation, so these tests skip — but LOUDLY, so a
+    /// permanently-skipped test can never masquerade as a passing one.
+    fn uffd_available() -> bool {
+        // SAFETY: a plain syscall with no pointer arguments.
+        let fd = unsafe { libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC) } as libc::c_int;
+        if fd < 0 {
+            eprintln!(
+                "\n  SKIPPED: userfaultfd unavailable ({}). \
+                 Set vm.unprivileged_userfaultfd=1 or run with CAP_SYS_PTRACE. \
+                 The signal backend (faultin_signal) covers the same architecture \
+                 and is not skipped.\n",
+                std::io::Error::last_os_error()
+            );
+            return false;
+        }
+        // SAFETY: fd is ours.
+        unsafe { libc::close(fd) };
+        true
+    }
+
     fn tmp(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!("loom-faultin-{}-{}", std::process::id(), name));
@@ -795,6 +818,9 @@ mod tests {
     /// and never exceeding the budget.
     #[test]
     fn raw_pointer_reads_are_correct_and_residency_stays_bounded() {
+        if !uffd_available() {
+            return;
+        }
         let p = tmp("read");
         let blocks = 256u64; // 16 MiB of arena
         let (loom, region) = seeded(&p, blocks, 8 * BS as u64);
@@ -866,6 +892,9 @@ mod tests {
     /// eviction and reload.
     #[test]
     fn raw_pointer_writes_are_tracked_and_persist() {
+        if !uffd_available() {
+            return;
+        }
         let p = tmp("write");
         let blocks = 128u64;
         let (loom, region) = seeded(&p, blocks, 8 * BS as u64);
@@ -943,6 +972,9 @@ mod tests {
 
     #[test]
     fn rejects_geometry_that_cannot_work() {
+        if !uffd_available() {
+            return;
+        }
         let p = tmp("geom");
         let (loom, region) = seeded(&p, 16, 4 * BS as u64);
         // Budget smaller than one extent.
@@ -967,6 +999,9 @@ mod tests {
     /// memory speed rather than device speed.
     #[test]
     fn a_hit_costs_nothing_because_no_loom_code_runs() {
+        if !uffd_available() {
+            return;
+        }
         let p = tmp("hitfree");
         let blocks = 16u64; // 1 MiB arena
         let (loom, region) = seeded(&p, blocks, 4 * BS as u64);

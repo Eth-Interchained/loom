@@ -803,6 +803,27 @@ mod tests {
 
     const BS: u32 = 64 * 1024;
 
+    /// Only one signal-backed arena may exist per process — the handler
+    /// finds its arena from the faulting address alone. That is a design
+    /// constraint, so the tests must respect it: `cargo test` runs tests in
+    /// parallel threads, and without this they race to install and the
+    /// loser's `new()` correctly refuses.
+    ///
+    /// This was NOT reproducible on the 2-core machine it was written on:
+    /// the long seeding phase staggers the tests enough that they rarely hit
+    /// `new()` together. macOS CI runners have more cores and collided
+    /// immediately. CI is the verifier for this fix, not the local run.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Poisoning is irrelevant here — a panicking test leaves no shared
+    /// state a later test can misread, because each acquires a fresh arena.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        match SERIAL.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        }
+    }
+
     fn tmp(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!("loom-sigfault-{}-{}", std::process::id(), name));
@@ -840,6 +861,7 @@ mod tests {
     /// with exact dirty tracking — and a warm pass that takes no faults.
     #[test]
     fn signal_backed_pointer_is_correct_bounded_and_free_when_warm() {
+        let _serial = serial();
         let p = tmp("all");
         let blocks = 192u64; // 12 MiB arena
         let (loom, region) = seeded(&p, blocks, 8 * BS as u64);
@@ -939,6 +961,7 @@ mod tests {
     /// path contains no Loom code at all.
     #[test]
     fn a_warm_pass_takes_no_faults() {
+        let _serial = serial();
         let p = tmp("warm");
         let blocks = 8u64;
         let (loom, region) = seeded(&p, blocks, 4 * BS as u64);
@@ -1002,6 +1025,7 @@ mod tests {
     /// eating it would silently break crash reporting.
     #[test]
     fn faults_outside_the_arena_are_not_claimed() {
+        let _serial = serial();
         let p = tmp("outside");
         let (loom, region) = seeded(&p, 8, 4 * BS as u64);
         let fa = SignalFaultArena::new(
@@ -1041,6 +1065,7 @@ mod tests {
 
     #[test]
     fn refuses_a_second_arena_in_one_process() {
+        let _serial = serial();
         let p1 = tmp("one");
         let p2 = tmp("two");
         let (l1, r1) = seeded(&p1, 8, 4 * BS as u64);
